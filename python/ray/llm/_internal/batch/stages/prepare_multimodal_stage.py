@@ -35,7 +35,7 @@ class PrepareMultimodalUDF(StatefulStageUDF):
                 "`pip install ray[llm]` to install required dependencies."
             ) from e
 
-        self.model_config = ModelConfig(model=model)
+        self.model_config = ModelConfig(model=model, allowed_local_media_path="/tmp")
         self.chat_template_content_format = chat_template_content_format
         self.apply_sys_msg_formatting = apply_sys_msg_formatting
 
