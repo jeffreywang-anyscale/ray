@@ -2,6 +2,7 @@ import subprocess
 import sys
 import os
 import json
+import random
 from time import perf_counter
 from dataclasses import dataclass
 
@@ -38,6 +39,22 @@ def video_preprocess(row: dict) -> dict:
     if not text_prompt:
         text_prompt = "What happens in this video?"
     
+    content = [
+        {
+            "type": "text",
+            "text": text_prompt,
+        },
+    ]
+
+    # Add video content only 50% of the time to mix text-only and video+text requests.
+    if random.random() < 0 and "video_url" in row:
+        content.append(
+            {
+                "type": "video_url",
+                "video_url": {"url": row["video_url"]},
+            }
+        )
+
     return {
         "messages": [
             {
@@ -49,21 +66,13 @@ def video_preprocess(row: dict) -> dict:
             },
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": text_prompt,
-                    },
-                    {
-                        "type": "video_url",
-                        "video_url": {"url": row["video_url"]},
-                    },
-                ],
+                "content": content,
             },
         ],
         "sampling_params": {
             "temperature": 0.3,
-            "max_tokens": 512,  # For QA responses
+            "max_tokens": 50,  # For QA responses
+            # "ignore_eos": True,
             "detokenize": False,
         },
         # Optional: Multimodal processor kwargs for video processing
@@ -294,23 +303,28 @@ def load_video_dataset(max_samples: int = None):
 def create_vlm_video_config():
     """Create VLM video configuration."""
     return vLLMEngineProcessorConfig(
-        # model_source="Qwen/Qwen3-VL-4B-Instruct",
-        model_source="Qwen/Qwen3-VL-30B-A3B-Instruct",
+        model_source="Qwen/Qwen3-VL-4B-Instruct",
+        # model_source="Qwen/Qwen3-VL-30B-A3B-Instruct",
         engine_kwargs=dict(
-            tensor_parallel_size=8,
+            tensor_parallel_size=4,
             pipeline_parallel_size=1,
+            # mm_encoder_tp_mode="data",
             trust_remote_code=True,
-            limit_mm_per_prompt={"video": 1},
+            limit_mm_per_prompt={"image": 0, "video": 0},
+            gpu_memory_utilization=0.8,
+            max_num_seqs=64,
         ),
         runtime_env={
             "env_vars": {"HF_TOKEN": ""},
         },
         batch_size=4,
+        max_concurrent_batches=16,
         accelerator_type="L4",
         concurrency=1,
+        should_continue_on_error=True,  # Skip bad videos instead of crashing
         prepare_multimodal_stage=PrepareMultimodalStageConfig(
             enabled=True,
-            concurrency=(50,50),
+            concurrency=(30,30),
             memory=6*1024*1024*1024,
             # model_config_kwargs=dict(
             #     # See available model config kwargs at https://docs.vllm.ai/en/latest/api/vllm/config/#vllm.config.ModelConfig
@@ -323,7 +337,7 @@ def create_vlm_video_config():
         ),
         tokenize_stage=TokenizerStageConfig(
             enabled=True,
-            concurrency=(50,50),
+            concurrency=(30,30),
         ),
         detokenize_stage=DetokenizeStageConfig(
             enabled=True,
@@ -426,7 +440,7 @@ if __name__ == "__main__":
                 print("MINIMAL VIDEO QA BENCHMARK (1 sample)")
                 print("=" * 60)
                 # Run benchmark with 500 samples (may take time/download multiple tarballs)
-                config, processor, result, benchmark_result = run_vlm_video_example(max_samples=2000)
+                config, processor, result, benchmark_result = run_vlm_video_example(max_samples=100)
                 
                 if benchmark_result:
                     print("\n✅ Benchmark completed successfully!")
