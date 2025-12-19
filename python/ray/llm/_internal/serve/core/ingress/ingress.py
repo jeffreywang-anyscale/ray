@@ -123,9 +123,19 @@ def _sanitize_chat_completion_request(
 
     TODO(seiji): Remove when we update to Pydantic v2.11+ with the fix.
     """
-    from vllm.tokenizers.mistral import maybe_serialize_tool_calls
-
-    maybe_serialize_tool_calls(request)
+    try:
+        from vllm.tokenizers.mistral import maybe_serialize_tool_calls
+        # Only call if request has messages with tool_calls
+        if hasattr(request, "messages") and request.messages:
+            has_tool_calls = any(
+                hasattr(msg, "tool_calls") and msg.tool_calls is not None
+                for msg in request.messages
+            )
+            if has_tool_calls:
+                maybe_serialize_tool_calls(request)
+    except (ImportError, TypeError, AttributeError):
+        # If vLLM is not available or sanitization fails, skip
+        pass
 
     return request
 
