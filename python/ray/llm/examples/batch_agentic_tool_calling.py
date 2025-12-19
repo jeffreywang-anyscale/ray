@@ -24,7 +24,6 @@ from ray.data.llm import ServeDeploymentProcessorConfig, build_processor
 from ray.serve.llm import LLMConfig, build_llm_deployment
 from ray.serve.llm.openai_api_models import ChatCompletionRequest, CompletionRequest
 import json
-import copy
 from typing import Dict, Any
 
 # Deploy the tool as a Ray Serve deployment
@@ -80,17 +79,16 @@ tools_raw = [{
             "type": "object",
             "properties": {
                 "location": {"type": "string", "description": "City and state, e.g., 'San Francisco, CA'"},
-                "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                "unit": {"type": "string", "enum": ["fahrenheit", "celsius"]}
             },
             "required": ["location", "unit"]
         }
     }
 }]
 
-# Convert tools to ensure they're JSON-serializable (deep copy and JSON round-trip)
+# Convert tools to ensure they're JSON-serializable (JSON round-trip)
 # This ensures no numpy arrays or other non-serializable types
-# Create a fresh copy to avoid any potential numpy contamination
-tools = json.loads(json.dumps(copy.deepcopy(tools_raw)))
+tools = json.loads(json.dumps(tools_raw))
 # Verify tools are plain Python types
 assert isinstance(tools, list), "Tools must be a list"
 assert all(isinstance(t, dict) for t in tools), "Each tool must be a dict"
@@ -162,13 +160,13 @@ def create_synthetic_dataset():
     """Create a synthetic dataset with weather queries."""
     locations = [
         "San Francisco, CA",
-        "New York, NY",
-        "Los Angeles, CA",
-        "Chicago, IL",
-        "Miami, FL",
-        "Seattle, WA",
-        "Boston, MA",
-        "Denver, CO",
+        # "New York, NY",
+        # "Los Angeles, CA",
+        # "Chicago, IL",
+        # "Miami, FL",
+        # "Seattle, WA",
+        # "Boston, MA",
+        # "Denver, CO",
     ]
     units = ["celsius", "fahrenheit"]
     
@@ -186,36 +184,6 @@ def create_synthetic_dataset():
     return ray.data.from_items(data)
 
 # Build the processor for agentic tool calling with Chat Completions API
-# Create a function to sanitize tools for each request to avoid ndarray serialization issues
-def sanitize_tools():
-    """Create a fresh, sanitized copy of tools for each request."""
-    # Create tools fresh each time to avoid any numpy contamination
-    # Explicitly use list() constructor to ensure enum is a plain Python list
-    tools_fresh = [{
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get the current weather in a given location",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "location": {"type": "string", "description": "City and state, e.g., 'San Francisco, CA'"},
-                    "unit": {"type": "string", "enum": list(["celsius", "fahrenheit"])}  # Explicit list() to avoid numpy
-                },
-                "required": list(["location", "unit"])  # Explicit list() to avoid numpy
-            }
-        }
-    }]
-    # JSON round-trip to ensure pure Python types (no numpy arrays)
-    sanitized = json.loads(json.dumps(tools_fresh))
-    # Double-check: recursively convert any remaining numpy arrays
-    def ensure_python_types(obj):
-        if isinstance(obj, dict):
-            return {k: ensure_python_types(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [ensure_python_types(item) for item in obj]
-        return obj
-    return ensure_python_types(sanitized)
 
 processor = build_processor(
     config,
@@ -233,8 +201,8 @@ processor = build_processor(
             messages=[
                 {"role": "user", "content": row["query"]}
             ],
-            # Create fresh tools for each request to avoid serialization issues
-            tools=sanitize_tools(),
+            # ServeDeploymentStageUDF handles numpy→Python conversion automatically
+            tools=tools,
             tool_choice="auto",
             stream=False,
         ),
@@ -252,7 +220,6 @@ processor = build_processor(
         error=row.get("error"),
         raw_response=row,
     ),
-    preprocess_map_kwargs={"batch_format": "python"},
 )
 
 # Create and process the synthetic dataset
@@ -268,58 +235,3 @@ ds = ds.materialize()
 print("\nResults:")
 results = ds.take_all()
 print(results)
-
-# for result in results:
-#     print(f"\nQuery: {result.get('query', 'N/A')}")
-#     print(f"Location: {result.get('location', 'N/A')}, Unit: {result.get('unit', 'N/A')}")
-    
-#     # Check for errors first
-#     if result.get("error"):
-#         error_msg = result.get("error")
-#         if isinstance(error_msg, dict):
-#             error_msg = error_msg.get("message", str(error_msg))
-#         print(f"Error in request: {error_msg}")
-#         continue
-    
-#     # Debug: print raw response structure if needed
-#     if not result.get("choices"):
-#         print(f"Warning: No choices in response. Raw keys: {list(result.keys())}")
-#         if "raw_response" in result:
-#             print(f"Raw response keys: {list(result.get('raw_response', {}).keys())}")
-#         continue
-    
-#     # Extract message from first choice
-#     message = result.get("choices", [{}])[0].get("message", {})
-#     tool_calls = message.get("tool_calls", [])
-#     response_content = message.get("content", "")
-    
-#     # Check if tool was called
-#     if tool_calls:
-#         tool_call = tool_calls[0]
-#         function_info = tool_call.get("function", {})
-#         function_name = function_info.get("name", "")
-#         arguments_str = function_info.get("arguments", "{}")
-        
-#         try:
-#             arguments = json.loads(arguments_str) if isinstance(arguments_str, str) else arguments_str
-#         except (json.JSONDecodeError, TypeError):
-#             arguments = {}
-#             print(f"Warning: Could not parse tool arguments: {arguments_str}")
-        
-#         print(f"Tool called: {function_name}")
-#         print(f"Arguments: {arguments}")
-        
-#         # Execute the tool via Ray Serve deployment
-#         if function_name == "get_weather":
-#             tool_request = {
-#                 "tool_name": "get_weather",
-#                 "tool_args": arguments
-#             }
-#             try:
-#                 tool_response = ray.get(tool_handle.remote(tool_request))
-#                 tool_result = tool_response.get("result", "Tool execution failed")
-#                 print(f"Tool result (from Ray Serve): {tool_result}")
-#             except Exception as e:
-#                 print(f"Error executing tool: {e}")
-#     else:
-#         print(f"Response: {response_content if response_content else 'No response content'}")

@@ -17,6 +17,31 @@ from ray.llm._internal.batch.stages.base import (
 logger = logging.getLogger(__name__)
 
 
+def _ensure_json_serializable(obj: Any) -> Any:
+    """Recursively convert numpy arrays/scalars to plain Python types.
+
+    Ray Data's Arrow/batch processing can convert Python lists to numpy arrays.
+    This function ensures all values are JSON-serializable before sending to
+    serve deployments that expect JSON payloads (e.g., vLLM).
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+
+    if np is not None:
+        if isinstance(obj, np.ndarray):
+            return [_ensure_json_serializable(x) for x in obj.tolist()]
+        if isinstance(obj, np.generic):
+            return obj.item()
+
+    if isinstance(obj, dict):
+        return {k: _ensure_json_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_ensure_json_serializable(v) for v in obj]
+    return obj
+
+
 class ServeDeploymentStageUDF(StatefulStageUDF):
     def __init__(
         self,
@@ -73,6 +98,9 @@ class ServeDeploymentStageUDF(StatefulStageUDF):
             dtype = self._dtype_mapping[dtype_name]
 
         request_kwargs = row.pop("request_kwargs")
+        # Sanitize request_kwargs to ensure all values are JSON-serializable.
+        # Ray Data may convert Python lists to numpy arrays during batch processing.
+        request_kwargs = _ensure_json_serializable(request_kwargs)
         request = {
             "request_id": str(self.request_id),
             "idx_in_batch": row[self.IDX_IN_BATCH_COLUMN],
@@ -102,6 +130,9 @@ class ServeDeploymentStageUDF(StatefulStageUDF):
 
         t = time.perf_counter()
         # Directly using anext() requires python3.10 and above
+        # breakpoint()
+        print("request ", request)
+        print("request_obj ", request_obj)
         output_data = await getattr(self._dh, method).remote(request_obj).__anext__()
         time_taken = time.perf_counter() - t
 
