@@ -472,6 +472,18 @@ def call_llm_sync(messages: List[Dict[str, Any]]) -> Dict[str, Any]:
     return response
 
 
+SYSTEM_PROMPT = """You are a helpful calendar assistant with access to tools for managing appointments.
+
+IMPORTANT: When the user asks you to book, schedule, or create an appointment, you MUST use the book_appointment tool to complete the action. Do NOT just say you will book something - actually call the tool to do it.
+
+Available tools:
+- check_availability: Check if a specific time slot is available
+- list_available_slots: List all available slots for a date
+- book_appointment: Book an appointment at a specific date and time
+
+Always complete the requested action by calling the appropriate tool. If a requested slot is not available, find an alternative and book it using the book_appointment tool."""
+
+
 def process_row_multi_turn(row: Dict[str, Any]) -> Dict[str, Any]:
     """Process a single row through multiple turns until completion.
     
@@ -491,7 +503,10 @@ def process_row_multi_turn(row: Dict[str, Any]) -> Dict[str, Any]:
     # Initialize state for this row
     row_id = row.get("id", "")
     query = row.get("query", "")
-    messages = [{"role": "user", "content": query}]
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": query}
+    ]
     conversation_history = []
     total_tool_calls = 0
     final_response = ""
