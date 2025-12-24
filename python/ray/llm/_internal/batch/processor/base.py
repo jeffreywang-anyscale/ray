@@ -92,7 +92,7 @@ class ProcessorConfig(BaseModelExtended):
             )
         return concurrency
 
-    def get_concurrency(self, autoscaling_enabled: bool = True) -> Tuple[int, int]:
+    def get_concurrency(self, autoscaling_enabled: bool = True) -> Dict[str, int]:
         """Return a normalized `(min, max)` worker range from `self.concurrency`.
 
         Behavior:
@@ -124,7 +124,10 @@ class ProcessorConfig(BaseModelExtended):
                 return 1, self.concurrency
             else:
                 return self.concurrency, self.concurrency
-        return self.concurrency
+        return {
+            "min_size": self.concurrency[0],
+            "max_size": self.concurrency[1],
+        }
 
     class Config:
         validate_assignment = True

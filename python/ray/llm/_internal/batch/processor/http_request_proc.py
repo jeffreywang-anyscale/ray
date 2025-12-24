@@ -90,7 +90,9 @@ def build_http_request_processor(
                 session_factory=config.session_factory,
             ),
             map_batches_kwargs=dict(
-                concurrency=config.concurrency,
+                compute=ray.data.ActorPoolStrategy(
+                    **config.get_concurrency(autoscaling_enabled=False),
+                )
             ),
         )
     ]
