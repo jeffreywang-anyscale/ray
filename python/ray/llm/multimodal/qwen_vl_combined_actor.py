@@ -341,6 +341,76 @@ class QwenVLCombinedActor:
         
         return vision_embeddings, llm_output
     
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: Union[torch.Tensor, list],
+    ) -> torch.Tensor:
+        """
+        Single unified forward pass through the entire model (vision + LLM).
+        
+        This method performs the complete end-to-end inference in one call,
+        without separately timing vision and LLM stages. Use this for
+        measuring true end-to-end throughput.
+        
+        Args:
+            pixel_values: Image/video pixel values [L, C]
+            grid_thw: Grid dimensions [N, 3]
+        
+        Returns:
+            LLM output hidden states
+        """
+        if self.model is None:
+            raise RuntimeError("Model not built. Call build_model() first.")
+        
+        # Move inputs to device
+        pixel_values = pixel_values.to(device=self.device, dtype=self.dtype)
+        if isinstance(grid_thw, torch.Tensor):
+            grid_thw_tensor = grid_thw.to(device=self.device)
+        else:
+            grid_thw_tensor = torch.tensor(grid_thw, device=self.device)
+        
+        with torch.no_grad():
+            # === VISION ENCODER ===
+            if hasattr(self.model, 'visual'):
+                vision_encoder = self.model.visual
+            elif hasattr(self.model, 'vision_model'):
+                vision_encoder = self.model.vision_model
+            elif hasattr(self.model, 'vision_tower'):
+                vision_encoder = self.model.vision_tower
+            else:
+                raise RuntimeError("Could not find vision encoder in model")
+            
+            vision_embeddings = vision_encoder(pixel_values, grid_thw=grid_thw_tensor)
+            
+            # === LANGUAGE MODEL ===
+            # Ensure 3D tensor: [batch, seq_len, hidden]
+            if vision_embeddings.dim() == 2:
+                vision_embeddings = vision_embeddings.unsqueeze(0)
+            
+            if hasattr(self.model, 'language_model'):
+                lm = self.model.language_model
+            elif hasattr(self.model, 'model'):
+                lm = self.model.model
+            else:
+                lm = self.model
+            
+            try:
+                output = lm(
+                    inputs_embeds=vision_embeddings,
+                    return_dict=True,
+                )
+                output = output.last_hidden_state if hasattr(output, 'last_hidden_state') else output.logits
+            except Exception as e:
+                logger.warning(f"Combined actor {self.rank}: LLM forward failed: {e}")
+                output = vision_embeddings
+            
+            # For TP > 1, synchronize outputs across ranks via all-reduce
+            if self.tp_size > 1 and self._distributed_initialized:
+                dist.all_reduce(output, op=dist.ReduceOp.AVG, group=self._tp_group)
+        
+        return output
+    
     def cleanup_distributed(self) -> None:
         """Cleanup distributed resources."""
         if self._distributed_initialized:

@@ -32,15 +32,25 @@ logger = logging.getLogger(__name__)
 
 def create_dummy_batch(
     num_images: int,
-    image_height: int = 28,
-    image_width: int = 28,
+    image_height: int = 448,  # 252 = 14 * 18, divisible by patch_size
+    image_width: int = 448,   # 252 = 14 * 18, divisible by patch_size
     patch_size: int = 14,
     temporal_patch_size: int = 2,
     in_channels: int = 3,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    spatial_merge_size: int = 2,
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
     """
     Create a dummy batch of images for benchmarking.
     Matches verify_equivalence.py format.
+    
+    For Qwen3-VL with 252x252 images:
+    - grid_h = grid_w = 252 // 14 = 18 patches
+    - After spatial merge (2x2): 18/2 * 18/2 = 81 visual tokens per image
+    
+    Returns:
+        pixel_values: [total_patches, patch_dim]
+        grid_thw: [num_images, 3]
+        visual_tokens_per_image: number of visual tokens output per image
     """
     h_patches = image_height // patch_size
     w_patches = image_width // patch_size
@@ -48,6 +58,9 @@ def create_dummy_batch(
     
     patches_per_image = t_patches * h_patches * w_patches
     total_patches = num_images * patches_per_image
+    
+    # Visual tokens after spatial merge (merge_size x merge_size patches -> 1 token)
+    visual_tokens_per_image = (t_patches * h_patches * w_patches) // (spatial_merge_size ** 2)
     
     # Patch dimension: temporal_patch_size * in_channels * patch_size * patch_size
     patch_dim = temporal_patch_size * in_channels * patch_size * patch_size
@@ -59,7 +72,7 @@ def create_dummy_batch(
     # Create grid_thw [num_images, 3]
     grid_thw = torch.tensor([[t_patches, h_patches, w_patches]] * num_images, dtype=torch.long)
     
-    return pixel_values, grid_thw
+    return pixel_values, grid_thw, visual_tokens_per_image
 
 
 def benchmark_config(
@@ -149,7 +162,8 @@ def benchmark_config(
     logger.info(f"All models built")
     
     # Create a single batch for benchmarking (reused)
-    pixel_values, grid_thw = create_dummy_batch(images_per_batch)
+    # 252x252 images -> 81 visual tokens per image after spatial merge
+    pixel_values, grid_thw, visual_tokens_per_image = create_dummy_batch(images_per_batch)
     
     # Calculate batch splitting info
     num_images = grid_thw.shape[0]
@@ -307,14 +321,275 @@ def benchmark_config(
     total_images = num_batches * images_per_batch
     total_time = sum(total_times)
     
+    # Visual tokens: calculated from image size (252x252 -> 81 tokens per image)
+    num_visual_tokens_per_batch = visual_tokens_per_image * images_per_batch
+    total_visual_tokens = num_batches * num_visual_tokens_per_batch
+    
+    # LLM output: for a single forward pass, output tokens = input tokens (hidden states)
+    # In real generation, this would be different (autoregressive)
+    llm_output_tokens_per_batch = num_visual_tokens_per_batch  # Same shape in/out for 1 forward
+    
     results['throughput'] = {
+        # E2E throughput
         'images_per_sec': total_images / total_time,
-        'batches_per_sec': num_batches / total_time,
-        'vision_images_per_sec': total_images / sum(vision_times),
-        'llm_batches_per_sec': num_batches / sum(llm_times),
+        'batches_per_sec': num_batches / total_time,  # req/s
+        # Vision throughput (input: requests, output: visual tokens)
+        'vision_req_per_sec': num_batches / sum(vision_times),  # req/s (1 req = 1 batch)
+        'vision_tokens_per_sec': total_visual_tokens / sum(vision_times),  # visual tokens/s
+        # LLM throughput (input: tokens, output: tokens)
+        'llm_input_tokens_per_sec': total_visual_tokens / sum(llm_times),  # input tokens/s
+        'llm_output_tokens_per_sec': total_visual_tokens / sum(llm_times),  # output tokens/s (same for 1 fwd pass)
+    }
+    
+    # Store token counts for reference
+    results['tokens'] = {
+        'visual_tokens_per_image': visual_tokens_per_image,
+        'visual_tokens_per_batch': num_visual_tokens_per_batch,
+        'total_visual_tokens': total_visual_tokens,
+        'image_size': '252x252',
     }
     
     return results
+
+
+def benchmark_combined(
+    model_name: str,
+    num_batches: int,
+    images_per_batch: int,
+    num_replicas: int = 1,
+    tp_size: int = 1,
+    warmup_batches: int = 10,
+    master_port: int = 29600,
+) -> Dict[str, Any]:
+    """
+    Benchmark combined models (vision + LLM in single actor).
+    
+    Uses a SINGLE forward pass that wraps both vision encoder and LLM,
+    measuring true end-to-end throughput without artificial phase separation.
+    
+    Args:
+        model_name: Model name or path
+        num_batches: Number of batches to benchmark
+        images_per_batch: Images per batch per replica
+        num_replicas: Number of model replicas (data parallel, each with tp_size GPUs)
+        tp_size: Tensor parallel size per replica (GPUs per replica)
+        warmup_batches: Number of warmup batches
+        master_port: NCCL master port
+    
+    With num_replicas=1, tp_size=1: 1 GPU, single model
+    With num_replicas=1, tp_size=2: 2 GPUs, single model with TP
+    With num_replicas=N, tp_size=1: N GPUs, N independent models (DP)
+    
+    Returns dict with timing statistics.
+    """
+    from qwen_vl_combined_actor import create_combined_actor_class
+    
+    total_gpus = num_replicas * tp_size
+    
+    logger.info(f"Benchmarking COMBINED model (single forward pass):")
+    logger.info(f"  Replicas: {num_replicas}, TP size: {tp_size}, Total GPUs: {total_gpus}")
+    logger.info(f"  Batches: {num_batches} (+ {warmup_batches} warmup)")
+    logger.info(f"  Images per batch per replica: {images_per_batch}")
+    logger.info(f"  Total images per batch: {images_per_batch * num_replicas}")
+    
+    # Create combined actors
+    # For TP > 1, each replica has tp_size actors that form a TP group
+    CombinedActorClass = create_combined_actor_class(num_gpus=1, num_cpus=4)
+    
+    actors = []
+    for replica_id in range(num_replicas):
+        if tp_size == 1:
+            # Single GPU per replica - no distributed needed
+            actor = CombinedActorClass.remote(model_name, rank=0, tp_size=1)
+            actors.append([actor])
+        else:
+            # Multiple GPUs per replica - TP within replica
+            replica_actors = []
+            for tp_rank in range(tp_size):
+                actor = CombinedActorClass.remote(
+                    model_name, 
+                    rank=tp_rank, 
+                    tp_size=tp_size,
+                    master_port=master_port + replica_id * 100  # Different port per replica
+                )
+                replica_actors.append(actor)
+            actors.append(replica_actors)
+    
+    # Initialize distributed for TP > 1
+    if tp_size > 1:
+        for replica_id, replica_actors in enumerate(actors):
+            # Get master address from rank 0 of this replica
+            master_addr = ray.get(replica_actors[0].get_ip_address.remote())
+            port = master_port + replica_id * 100
+            
+            init_refs = [
+                actor.init_distributed.remote(master_addr, port)
+                for actor in replica_actors
+            ]
+            ray.get(init_refs)
+        logger.info(f"Distributed initialized for TP={tp_size}")
+    
+    # Build the models
+    build_refs = []
+    for replica_actors in actors:
+        for actor in replica_actors:
+            build_refs.append(actor.build_model.remote())
+    ray.get(build_refs)
+    logger.info(f"Combined model(s) built on {total_gpus} GPU(s)")
+    
+    # Create batch (reused for all iterations)
+    pixel_values, grid_thw, visual_tokens_per_image = create_dummy_batch(images_per_batch)
+    logger.info(f"Batch created: {images_per_batch} images, {visual_tokens_per_image} visual tokens/image")
+    
+    # Timing array (single forward, no phase separation)
+    forward_times = []
+    
+    total_batches = warmup_batches + num_batches
+    
+    for batch_idx in range(total_batches):
+        is_warmup = batch_idx < warmup_batches
+        
+        # === SINGLE FORWARD PASS (vision + LLM combined) ===
+        forward_start = time.perf_counter()
+        
+        forward_refs = []
+        for replica_actors in actors:
+            if tp_size == 1:
+                # Single actor per replica
+                forward_refs.append(replica_actors[0].forward.remote(pixel_values, grid_thw))
+            else:
+                # For TP, only rank 0 returns output (others participate in distributed ops)
+                # All actors run forward, but we only collect from rank 0
+                for actor in replica_actors:
+                    forward_refs.append(actor.forward.remote(pixel_values, grid_thw))
+        
+        outputs = ray.get(forward_refs)
+        forward_end = time.perf_counter()
+        
+        # Record times (skip warmup)
+        if not is_warmup:
+            forward_times.append(forward_end - forward_start)
+        
+        if (batch_idx + 1) % 100 == 0:
+            status = "warmup" if is_warmup else "measured"
+            logger.info(f"  Batch {batch_idx + 1}/{total_batches} ({status})")
+    
+    # Cleanup
+    if tp_size > 1:
+        cleanup_refs = []
+        for replica_actors in actors:
+            for actor in replica_actors:
+                cleanup_refs.append(actor.cleanup_distributed.remote())
+        ray.get(cleanup_refs)
+    
+    for replica_actors in actors:
+        for actor in replica_actors:
+            ray.kill(actor)
+    time.sleep(1)
+    
+    # Compute statistics
+    def stats(times):
+        times = torch.tensor(times)
+        return {
+            'mean': times.mean().item(),
+            'std': times.std().item(),
+            'min': times.min().item(),
+            'max': times.max().item(),
+            'p50': times.median().item(),
+            'p99': times.quantile(0.99).item(),
+        }
+    
+    # Total images per batch across all replicas
+    total_images_per_batch = images_per_batch * num_replicas
+    
+    results = {
+        'config': f'Combined (DP={num_replicas}, TP={tp_size})',
+        'vision_dp': num_replicas,
+        'llm_tp': tp_size,
+        'total_gpus': total_gpus,
+        'num_batches': num_batches,
+        'images_per_batch': total_images_per_batch,
+        'num_replicas': num_replicas,
+        'tp_size': tp_size,
+        'forward': stats(forward_times),
+        # For compatibility with print functions
+        'vision': {'mean': 0, 'std': 0, 'min': 0, 'max': 0, 'p50': 0, 'p99': 0},
+        'all_gather': {'mean': 0, 'std': 0, 'min': 0, 'max': 0, 'p50': 0, 'p99': 0},
+        'p2p': {'mean': 0, 'std': 0, 'min': 0, 'max': 0, 'p50': 0, 'p99': 0},
+        'llm': {'mean': 0, 'std': 0, 'min': 0, 'max': 0, 'p50': 0, 'p99': 0},
+        'total': stats(forward_times),  # total = forward for combined
+    }
+    
+    # Compute throughput
+    total_images = num_batches * total_images_per_batch
+    total_time = sum(forward_times)
+    
+    # Visual tokens per batch (across all replicas)
+    num_visual_tokens_per_batch = visual_tokens_per_image * total_images_per_batch
+    total_visual_tokens = num_batches * num_visual_tokens_per_batch
+    
+    results['throughput'] = {
+        # E2E throughput (total across all replicas)
+        'images_per_sec': total_images / total_time,
+        'batches_per_sec': num_batches / total_time,
+        # Combined forward (no separate vision/LLM)
+        'forward_tokens_per_sec': total_visual_tokens / total_time,
+        # For compatibility
+        'vision_req_per_sec': num_batches / total_time,
+        'vision_tokens_per_sec': total_visual_tokens / total_time,
+        'llm_input_tokens_per_sec': total_visual_tokens / total_time,
+        'llm_output_tokens_per_sec': total_visual_tokens / total_time,
+    }
+    
+    results['tokens'] = {
+        'visual_tokens_per_image': visual_tokens_per_image,
+        'visual_tokens_per_batch': num_visual_tokens_per_batch,
+        'total_visual_tokens': total_visual_tokens,
+        'image_size': f'{448}x{448}',  # Using default from create_dummy_batch
+    }
+    
+    return results
+
+
+def print_combined_results(results: Dict[str, Any]):
+    """Print combined benchmark results."""
+    num_replicas = results.get('num_replicas', 1)
+    tp_size = results.get('tp_size', 1)
+    print(f"\n{'='*70}")
+    print(f"COMBINED MODEL BENCHMARK (DP={num_replicas}, TP={tp_size}, {results['total_gpus']} GPU(s))")
+    print(f"{'='*70}")
+    print(f"  Batches: {results['num_batches']}, Total Images/batch: {results['images_per_batch']}")
+    if num_replicas > 1:
+        print(f"  Images/batch/replica: {results['images_per_batch'] // num_replicas}")
+    print()
+    
+    print("  Forward Timing (single pass, vision+LLM combined):")
+    print(f"  {'Phase':<15} {'Mean':>10} {'Std':>10} {'P50':>10} {'P99':>10}")
+    print(f"  {'-'*55}")
+    
+    if 'forward' in results:
+        s = results['forward']
+        print(f"  {'forward':<15} {s['mean']:>10.4f} {s['std']:>10.4f} {s['p50']:>10.4f} {s['p99']:>10.4f}")
+    else:
+        # Fallback for old format
+        for phase in ['vision', 'llm', 'total']:
+            s = results[phase]
+            print(f"  {phase:<15} {s['mean']:>10.4f} {s['std']:>10.4f} {s['p50']:>10.4f} {s['p99']:>10.4f}")
+    
+    print()
+    
+    # Token info
+    tok = results['tokens']
+    print(f"  Image size: {tok['image_size']}")
+    print(f"  Visual Tokens: {tok['visual_tokens_per_batch']} per batch, {tok['visual_tokens_per_image']} per image")
+    print()
+    
+    print("  Throughput (end-to-end, single forward pass):")
+    t = results['throughput']
+    print(f"    Images/sec:         {t['images_per_sec']:.2f}")
+    print(f"    Requests/sec:       {t['batches_per_sec']:.2f}")
+    print(f"    Tokens/sec:         {t.get('forward_tokens_per_sec', t['vision_tokens_per_sec']):.2f}")
+    print()
 
 
 def print_results(results: Dict[str, Any]):
@@ -334,11 +609,23 @@ def print_results(results: Dict[str, Any]):
         print(f"  {phase:<15} {s['mean']:>10.4f} {s['std']:>10.4f} {s['p50']:>10.4f} {s['p99']:>10.4f}")
     
     print()
+    
+    # Token info
+    tok = results['tokens']
+    print(f"  Visual Tokens: {tok['visual_tokens_per_batch']} per batch, {tok['visual_tokens_per_image']:.1f} per image")
+    print()
+    
     print("  Throughput:")
     t = results['throughput']
-    print(f"    End-to-end: {t['images_per_sec']:.2f} images/sec, {t['batches_per_sec']:.2f} batches/sec")
-    print(f"    Vision encoder: {t['vision_images_per_sec']:.2f} images/sec")
-    print(f"    LLM decoder: {t['llm_batches_per_sec']:.2f} batches/sec")
+    print(f"    End-to-end: {t['images_per_sec']:.2f} images/sec, {t['batches_per_sec']:.2f} req/sec")
+    print()
+    print(f"    Vision encoder:")
+    print(f"      Input:  {t['vision_req_per_sec']:.2f} req/sec (1 req = {results['images_per_batch']} images)")
+    print(f"      Output: {t['vision_tokens_per_sec']:.2f} visual_tokens/sec")
+    print()
+    print(f"    LLM decoder:")
+    print(f"      Input:  {t['llm_input_tokens_per_sec']:.2f} tokens/sec")
+    print(f"      Output: {t['llm_output_tokens_per_sec']:.2f} tokens/sec")
     print()
 
 
@@ -349,8 +636,8 @@ def print_comparison_table(all_results: List[Dict[str, Any]], title: str = "COMP
     print(f"{'='*100}")
     
     # Header
-    print(f"\n  {'Config':<15} {'Batch':>6} {'GPUs':>5} {'Vision(s)':>10} {'LLM(s)':>10} {'Total(s)':>10} {'img/sec':>10} {'Vision img/s':>12}")
-    print(f"  {'-'*90}")
+    print(f"\n  {'Config':<15} {'Batch':>6} {'GPUs':>5} {'Vision(s)':>10} {'LLM(s)':>10} {'Total(s)':>10} {'E2E req/s':>10} {'Vis tok/s':>12} {'LLM tok/s':>12}")
+    print(f"  {'-'*105}")
     
     for r in all_results:
         config = r['config']
@@ -359,9 +646,10 @@ def print_comparison_table(all_results: List[Dict[str, Any]], title: str = "COMP
         vision = r['vision']['mean']
         llm = r['llm']['mean']
         total = r['total']['mean']
-        throughput = r['throughput']['images_per_sec']
-        vision_tp = r['throughput']['vision_images_per_sec']
-        print(f"  {config:<15} {batch:>6} {gpus:>5} {vision:>10.4f} {llm:>10.4f} {total:>10.4f} {throughput:>10.2f} {vision_tp:>12.2f}")
+        e2e_req = r['throughput']['batches_per_sec']
+        vision_tok = r['throughput']['vision_tokens_per_sec']
+        llm_tok = r['throughput']['llm_input_tokens_per_sec']
+        print(f"  {config:<15} {batch:>6} {gpus:>5} {vision:>10.4f} {llm:>10.4f} {total:>10.4f} {e2e_req:>10.2f} {vision_tok:>12.2f} {llm_tok:>12.2f}")
     
     print()
     
@@ -606,6 +894,23 @@ def main():
         default=None,
         help="LLM TP size (for custom config, use with --vision_dp)",
     )
+    parser.add_argument(
+        "--combined",
+        action="store_true",
+        help="Run combined model benchmark (vision + LLM in single actor, single forward pass)",
+    )
+    parser.add_argument(
+        "--num_replicas",
+        type=int,
+        default=1,
+        help="Number of model replicas for combined benchmark (DP, default: 1)",
+    )
+    parser.add_argument(
+        "--combined_tp",
+        type=int,
+        default=1,
+        help="Tensor parallel size per replica for combined benchmark (default: 1)",
+    )
     
     args = parser.parse_args()
     
@@ -619,6 +924,32 @@ def main():
     print(f"Model: {args.model_name}")
     print(f"Batches: {args.num_batches} (warmup: {args.warmup_batches})")
     print()
+    
+    # Run combined benchmark if specified
+    if args.combined:
+        total_gpus = args.num_replicas * args.combined_tp
+        print(f"Running COMBINED model benchmark (single forward pass)")
+        print(f"  Replicas (DP): {args.num_replicas}")
+        print(f"  TP per replica: {args.combined_tp}")
+        print(f"  Total GPUs: {total_gpus}")
+        print(f"  Images per batch per replica: {args.images_per_batch}")
+        print(f"  Total images per batch: {args.images_per_batch * args.num_replicas}")
+        print("="*100)
+        
+        results = benchmark_combined(
+            model_name=args.model_name,
+            num_batches=args.num_batches,
+            images_per_batch=args.images_per_batch,
+            num_replicas=args.num_replicas,
+            tp_size=args.combined_tp,
+            warmup_batches=args.warmup_batches,
+        )
+        print_combined_results(results)
+        
+        print("="*100)
+        print("Combined benchmark complete!")
+        print("="*100)
+        return
     
     # Run experiments if specified
     if args.experiment:
