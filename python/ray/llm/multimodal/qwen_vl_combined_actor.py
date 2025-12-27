@@ -1,15 +1,14 @@
 """
-Qwen VL Combined Actor - Full Model (Vision + LLM) with TP Support
+Qwen VL Combined Actor - Full Model (Vision + LLM) in Single Actor
 
 This module implements a Ray actor that hosts the complete Qwen VL model
 including both the vision encoder and language model backbone.
 
-Supports:
-- Data Parallelism (DP) on the vision encoder
-- Tensor Parallelism (TP) on the language model via torch.distributed
+Use this for:
+- Baseline benchmarks (single forward pass through entire VLM)
+- Comparison with disaggregated approach
 
-This is used for comparison with the disaggregated approach to verify
-that both produce identical outputs.
+For DP/TP configurations, use qwen3_vl_vision_actor.py and qwen3_vl_llm_actor.py.
 """
 
 import logging
@@ -30,12 +29,12 @@ class QwenVLCombinedActor:
     Ray actor that hosts the complete Qwen VL model (vision + LLM).
     
     This actor loads the full model and can process end-to-end from
-    images to language model outputs. Supports TP on the LLM portion.
+    images to language model outputs in a single forward pass.
     
     Args:
         model_name_or_path: HuggingFace model name or local path
-        rank: Actor rank (used for both vision DP and LLM TP)
-        tp_size: Tensor parallel size for LLM (default: 1)
+        rank: Actor rank (for DP across replicas)
+        world_size: Total number of replicas
         dtype: Model dtype (default: bfloat16)
         device: Device to use (default: cuda:0)
     """
@@ -44,38 +43,37 @@ class QwenVLCombinedActor:
         self,
         model_name_or_path: str,
         rank: int = 0,
-        tp_size: int = 1,
-        master_addr: str = None,
-        master_port: int = 29500,
+        world_size: int = 1,
         dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda:0",
     ):
         self.model_name_or_path = model_name_or_path
         self.rank = rank
-        self.tp_size = tp_size
-        self.master_addr = master_addr
-        self.master_port = master_port
+        self.world_size = world_size
         self.dtype = dtype
         self.device = torch.device(device)
         self.model: Optional[nn.Module] = None
         self.config = None
         self.model_type = None
         self._distributed_initialized = False
-        self._tp_group = None
         
         logger.info(
-            f"Combined actor {rank} (TP size={tp_size}) initialized with model {model_name_or_path}"
+            f"Combined actor rank={rank}/{world_size} initialized "
+            f"with model {model_name_or_path}"
         )
     
     def get_ip_address(self) -> str:
         """Get the IP address of this actor for NCCL communication."""
         hostname = socket.gethostname()
-        ip_addr = socket.gethostbyname(hostname)
-        return ip_addr
+        return socket.gethostbyname(hostname)
     
-    def init_distributed(self, master_addr: str, master_port: int) -> None:
+    def init_distributed(
+        self,
+        master_addr: str,
+        master_port: int,
+    ) -> None:
         """
-        Initialize distributed environment for tensor parallelism on LLM.
+        Initialize distributed environment for multi-replica setup.
         
         Args:
             master_addr: IP address of rank 0 for NCCL rendezvous
@@ -84,46 +82,48 @@ class QwenVLCombinedActor:
         if self._distributed_initialized:
             logger.info(f"Combined actor {self.rank}: Distributed already initialized")
             return
-            
-        if self.tp_size <= 1:
-            logger.info(f"Combined actor {self.rank}: TP size is 1, skipping distributed init")
-            return
         
-        self.master_addr = master_addr
-        self.master_port = master_port
+        if self.world_size <= 1:
+            logger.info(f"Combined actor {self.rank}: Single replica, skipping distributed")
+            return
         
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = str(master_port)
         os.environ["RANK"] = str(self.rank)
-        os.environ["WORLD_SIZE"] = str(self.tp_size)
+        os.environ["WORLD_SIZE"] = str(self.world_size)
         
         logger.info(
             f"Combined actor {self.rank}: Initializing distributed "
-            f"(master={master_addr}:{master_port}, rank={self.rank}/{self.tp_size})"
+            f"(master={master_addr}:{master_port}, rank={self.rank}/{self.world_size})"
         )
         
         dist.init_process_group(
             backend="nccl",
             rank=self.rank,
-            world_size=self.tp_size,
+            world_size=self.world_size,
         )
         
-        # Create a TP process group
-        self._tp_group = dist.new_group(ranks=list(range(self.tp_size)))
-        
         self._distributed_initialized = True
-        logger.info(f"Combined actor {self.rank}: Distributed initialized successfully")
+        logger.info(f"Combined actor {self.rank}: Distributed initialized")
+    
+    def cleanup_distributed(self) -> None:
+        """Clean up distributed resources."""
+        if self._distributed_initialized:
+            try:
+                dist.destroy_process_group()
+                self._distributed_initialized = False
+                logger.info(f"Combined actor {self.rank}: Distributed cleaned up")
+            except Exception as e:
+                logger.warning(f"Combined actor {self.rank}: Cleanup failed: {e}")
     
     def build_model(self) -> None:
         """
         Build and load the complete Qwen VL model.
         """
-        import torch
         from transformers import AutoConfig, AutoModel
         
         logger.info(f"Combined actor {self.rank}: Loading config from {self.model_name_or_path}")
         
-        # Load HuggingFace config
         hf_config = AutoConfig.from_pretrained(
             self.model_name_or_path,
             trust_remote_code=True,
@@ -141,9 +141,6 @@ class QwenVLCombinedActor:
         
         logger.info(f"Combined actor {self.rank}: Detected model type: {self.model_type}")
         
-        # Load the full model
-        logger.info(f"Combined actor {self.rank}: Loading full model from transformers")
-        
         try:
             self.model = AutoModel.from_pretrained(
                 self.model_name_or_path,
@@ -152,194 +149,11 @@ class QwenVLCombinedActor:
             )
             self.model = self.model.to(self.device)
             self.model.eval()
-            logger.info(f"Combined actor {self.rank}: Full model loaded successfully")
+            logger.info(f"Combined actor {self.rank}: Full model loaded")
             
         except Exception as e:
             logger.error(f"Combined actor {self.rank}: Error loading model: {e}")
             raise
-    
-    def forward_vision(
-        self,
-        pixel_values: torch.Tensor,
-        grid_thw: Union[torch.Tensor, list],
-    ) -> torch.Tensor:
-        """
-        Forward pass through just the vision encoder part.
-        
-        Args:
-            pixel_values: Image/video pixel values [L, C]
-            grid_thw: Grid dimensions [N, 3]
-        
-        Returns:
-            Vision embeddings [num_tokens, hidden_size]
-        """
-        if self.model is None:
-            raise RuntimeError("Model not built. Call build_model() first.")
-        
-        # Move inputs to device
-        pixel_values = pixel_values.to(device=self.device, dtype=self.dtype)
-        if isinstance(grid_thw, torch.Tensor):
-            grid_thw_tensor = grid_thw.to(device=self.device)
-        else:
-            grid_thw_tensor = torch.tensor(grid_thw, device=self.device)
-        
-        with torch.no_grad():
-            # Access the vision encoder
-            if hasattr(self.model, 'visual'):
-                vision_encoder = self.model.visual
-            elif hasattr(self.model, 'vision_model'):
-                vision_encoder = self.model.vision_model
-            elif hasattr(self.model, 'vision_tower'):
-                vision_encoder = self.model.vision_tower
-            else:
-                raise RuntimeError("Could not find vision encoder in model")
-            
-            embeddings = vision_encoder(pixel_values, grid_thw=grid_thw_tensor)
-        
-        logger.info(
-            f"Combined actor {self.rank}: Vision - input shape {pixel_values.shape}, "
-            f"output shape {embeddings.shape}"
-        )
-        
-        return embeddings
-    
-    def all_gather_vision_embeddings(
-        self,
-        local_embeddings: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        All-gather vision embeddings from all DP actors.
-        
-        Each actor has processed a portion of the images. This method
-        gathers all partial embeddings so each actor has the FULL batch.
-        
-        Args:
-            local_embeddings: This actor's vision embeddings [local_seq, hidden]
-        
-        Returns:
-            Full vision embeddings from all actors [total_seq, hidden]
-        """
-        if self.tp_size <= 1 or not self._distributed_initialized:
-            return local_embeddings
-        
-        local_embeddings = local_embeddings.to(device=self.device, dtype=self.dtype)
-        
-        # Get the size from all ranks to handle variable sizes
-        local_size = torch.tensor([local_embeddings.shape[0]], device=self.device)
-        all_sizes = [torch.zeros(1, device=self.device, dtype=torch.long) for _ in range(self.tp_size)]
-        dist.all_gather(all_sizes, local_size, group=self._tp_group)
-        all_sizes = [int(s.item()) for s in all_sizes]
-        
-        max_size = max(all_sizes)
-        hidden_size = local_embeddings.shape[-1]
-        
-        # Pad local embeddings to max size
-        if local_embeddings.shape[0] < max_size:
-            padding = torch.zeros(
-                max_size - local_embeddings.shape[0], hidden_size,
-                device=self.device, dtype=self.dtype
-            )
-            padded_local = torch.cat([local_embeddings, padding], dim=0)
-        else:
-            padded_local = local_embeddings
-        
-        # All-gather padded tensors
-        gathered = [torch.zeros_like(padded_local) for _ in range(self.tp_size)]
-        dist.all_gather(gathered, padded_local, group=self._tp_group)
-        
-        # Trim padding and concatenate
-        trimmed = [gathered[i][:all_sizes[i]] for i in range(self.tp_size)]
-        full_embeddings = torch.cat(trimmed, dim=0)
-        
-        logger.info(
-            f"Combined actor {self.rank}: All-gathered vision embeddings "
-            f"from {local_embeddings.shape} to {full_embeddings.shape}"
-        )
-        
-        return full_embeddings
-    
-    def forward_llm(
-        self,
-        vision_embeddings: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Forward pass through just the language model part.
-        
-        For TP > 1, all actors receive the same vision embeddings (full batch)
-        and synchronize their outputs via all-reduce.
-        
-        Args:
-            vision_embeddings: Vision encoder outputs [seq_len, hidden] or [batch, seq_len, hidden]
-        
-        Returns:
-            Language model hidden states
-        """
-        if self.model is None:
-            raise RuntimeError("Model not built. Call build_model() first.")
-        
-        # Move inputs to device
-        vision_embeddings = vision_embeddings.to(device=self.device, dtype=self.dtype)
-        
-        # Ensure 3D tensor: [batch, seq_len, hidden]
-        if vision_embeddings.dim() == 2:
-            vision_embeddings = vision_embeddings.unsqueeze(0)
-        
-        with torch.no_grad():
-            # Access the language model
-            if hasattr(self.model, 'language_model'):
-                lm = self.model.language_model
-            elif hasattr(self.model, 'model'):
-                lm = self.model.model
-            else:
-                lm = self.model
-            
-            try:
-                output = lm(
-                    inputs_embeds=vision_embeddings,
-                    return_dict=True,
-                )
-                output = output.last_hidden_state if hasattr(output, 'last_hidden_state') else output.logits
-            except Exception as e:
-                logger.warning(f"Combined actor {self.rank}: LLM forward failed: {e}")
-                output = vision_embeddings
-            
-            # For TP > 1, synchronize outputs across ranks via all-reduce
-            if self.tp_size > 1 and self._distributed_initialized:
-                dist.all_reduce(output, op=dist.ReduceOp.AVG, group=self._tp_group)
-                logger.debug(f"Combined actor {self.rank}: All-reduce completed")
-        
-        logger.info(
-            f"Combined actor {self.rank}: LLM - input shape {vision_embeddings.shape}, "
-            f"output shape {output.shape}"
-        )
-        
-        return output
-    
-    def forward_full(
-        self,
-        pixel_values: torch.Tensor,
-        grid_thw: Union[torch.Tensor, list],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Full forward pass through vision encoder and language model.
-        
-        This is the combined end-to-end path that should produce
-        identical results to the disaggregated approach.
-        
-        Args:
-            pixel_values: Image/video pixel values [L, C]
-            grid_thw: Grid dimensions [N, 3]
-        
-        Returns:
-            Tuple of (vision_embeddings, llm_output)
-        """
-        # First pass through vision encoder
-        vision_embeddings = self.forward_vision(pixel_values, grid_thw)
-        
-        # Then pass through language model
-        llm_output = self.forward_llm(vision_embeddings)
-        
-        return vision_embeddings, llm_output
     
     def forward(
         self,
@@ -349,9 +163,7 @@ class QwenVLCombinedActor:
         """
         Single unified forward pass through the entire model (vision + LLM).
         
-        This method performs the complete end-to-end inference in one call,
-        without separately timing vision and LLM stages. Use this for
-        measuring true end-to-end throughput.
+        This performs end-to-end inference in one call for true throughput measurement.
         
         Args:
             pixel_values: Image/video pixel values [L, C]
@@ -363,7 +175,6 @@ class QwenVLCombinedActor:
         if self.model is None:
             raise RuntimeError("Model not built. Call build_model() first.")
         
-        # Move inputs to device
         pixel_values = pixel_values.to(device=self.device, dtype=self.dtype)
         if isinstance(grid_thw, torch.Tensor):
             grid_thw_tensor = grid_thw.to(device=self.device)
@@ -384,7 +195,6 @@ class QwenVLCombinedActor:
             vision_embeddings = vision_encoder(pixel_values, grid_thw=grid_thw_tensor)
             
             # === LANGUAGE MODEL ===
-            # Ensure 3D tensor: [batch, seq_len, hidden]
             if vision_embeddings.dim() == 2:
                 vision_embeddings = vision_embeddings.unsqueeze(0)
             
@@ -396,27 +206,112 @@ class QwenVLCombinedActor:
                 lm = self.model
             
             try:
-                output = lm(
-                    inputs_embeds=vision_embeddings,
-                    return_dict=True,
-                )
-                output = output.last_hidden_state if hasattr(output, 'last_hidden_state') else output.logits
+                result = lm(inputs_embeds=vision_embeddings, return_dict=True)
+                output = result.last_hidden_state if hasattr(result, 'last_hidden_state') else result.logits
             except Exception as e:
                 logger.warning(f"Combined actor {self.rank}: LLM forward failed: {e}")
                 output = vision_embeddings
+        
+        logger.info(
+            f"Combined actor {self.rank}: Forward complete, "
+            f"input {pixel_values.shape} -> output {output.shape}"
+        )
+        return output
+    
+    def forward_vision(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: Union[torch.Tensor, list],
+    ) -> torch.Tensor:
+        """
+        Forward pass through just the vision encoder.
+        
+        Args:
+            pixel_values: Image/video pixel values [L, C]
+            grid_thw: Grid dimensions [N, 3]
+        
+        Returns:
+            Vision embeddings [num_tokens, hidden_size]
+        """
+        if self.model is None:
+            raise RuntimeError("Model not built. Call build_model() first.")
+        
+        pixel_values = pixel_values.to(device=self.device, dtype=self.dtype)
+        if isinstance(grid_thw, torch.Tensor):
+            grid_thw_tensor = grid_thw.to(device=self.device)
+        else:
+            grid_thw_tensor = torch.tensor(grid_thw, device=self.device)
+        
+        with torch.no_grad():
+            if hasattr(self.model, 'visual'):
+                vision_encoder = self.model.visual
+            elif hasattr(self.model, 'vision_model'):
+                vision_encoder = self.model.vision_model
+            elif hasattr(self.model, 'vision_tower'):
+                vision_encoder = self.model.vision_tower
+            else:
+                raise RuntimeError("Could not find vision encoder in model")
             
-            # For TP > 1, synchronize outputs across ranks via all-reduce
-            if self.tp_size > 1 and self._distributed_initialized:
-                dist.all_reduce(output, op=dist.ReduceOp.AVG, group=self._tp_group)
+            embeddings = vision_encoder(pixel_values, grid_thw=grid_thw_tensor)
+        
+        return embeddings
+    
+    def forward_llm(
+        self,
+        vision_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Forward pass through just the language model.
+        
+        Args:
+            vision_embeddings: Vision encoder outputs [seq_len, hidden] or [batch, seq_len, hidden]
+        
+        Returns:
+            Language model hidden states
+        """
+        if self.model is None:
+            raise RuntimeError("Model not built. Call build_model() first.")
+        
+        vision_embeddings = vision_embeddings.to(device=self.device, dtype=self.dtype)
+        
+        if vision_embeddings.dim() == 2:
+            vision_embeddings = vision_embeddings.unsqueeze(0)
+        
+        with torch.no_grad():
+            if hasattr(self.model, 'language_model'):
+                lm = self.model.language_model
+            elif hasattr(self.model, 'model'):
+                lm = self.model.model
+            else:
+                lm = self.model
+            
+            try:
+                result = lm(inputs_embeds=vision_embeddings, return_dict=True)
+                output = result.last_hidden_state if hasattr(result, 'last_hidden_state') else result.logits
+            except Exception as e:
+                logger.warning(f"Combined actor {self.rank}: LLM forward failed: {e}")
+                output = vision_embeddings
         
         return output
     
-    def cleanup_distributed(self) -> None:
-        """Cleanup distributed resources."""
-        if self._distributed_initialized:
-            dist.destroy_process_group()
-            self._distributed_initialized = False
-            logger.info(f"Combined actor {self.rank}: Distributed cleanup completed")
+    def forward_full(
+        self,
+        pixel_values: torch.Tensor,
+        grid_thw: Union[torch.Tensor, list],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Full forward pass returning both vision embeddings and LLM output.
+        
+        Args:
+            pixel_values: Image/video pixel values [L, C]
+            grid_thw: Grid dimensions [N, 3]
+        
+        Returns:
+            Tuple of (vision_embeddings, llm_output)
+        """
+        vision_embeddings = self.forward_vision(pixel_values, grid_thw)
+        llm_output = self.forward_llm(vision_embeddings)
+        return vision_embeddings, llm_output
     
     def get_vision_hidden_size(self) -> int:
         """Get the output hidden size of the vision encoder."""
@@ -436,7 +331,7 @@ class QwenVLCombinedActor:
 
 def create_combined_actor_class(num_gpus: int = 1, num_cpus: int = 4):
     """
-    Create a Ray remote class for the combined actor with specified resources.
+    Create a Ray remote class for the combined actor.
     
     Args:
         num_gpus: Number of GPUs per actor
@@ -446,3 +341,4 @@ def create_combined_actor_class(num_gpus: int = 1, num_cpus: int = 4):
         Ray remote class
     """
     return ray.remote(num_gpus=num_gpus, num_cpus=num_cpus)(QwenVLCombinedActor)
+

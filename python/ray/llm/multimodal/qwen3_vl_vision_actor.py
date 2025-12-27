@@ -3,18 +3,20 @@ Qwen VL Vision Encoder Ray Actor with Data Parallelism
 
 This module implements a Ray actor that hosts the Qwen VL vision encoder.
 Supports both Qwen2.5-VL and Qwen3-VL models.
+
 Multiple actors can be created for data parallelism - each actor processes
 different portions of the input batch independently.
 
-The vision encoder is loaded using HuggingFace transformers.
-
-Supports NCCL-based all_gather for efficient embedding aggregation.
+Supports:
+- NCCL-based all_gather for efficient embedding aggregation
+- NCCL P2P/broadcast to send embeddings to LLM actors
+- Colocated mode (vision + LLM on same GPU)
 """
 
 import logging
 import os
 import socket
-from typing import Optional, Union, Tuple, List
+from typing import Optional, Union, Tuple
 
 import ray
 import torch
@@ -26,21 +28,16 @@ logger = logging.getLogger(__name__)
 
 class QwenVLVisionActor:
     """
-    Ray actor that hosts a Qwen VL vision encoder.
+    Ray actor that hosts a Qwen VL vision encoder with data parallelism.
     
-    This actor loads the vision encoder from HuggingFace transformers and can 
-    process image/video inputs. Multiple actors can be used for data parallelism.
-    
-    Supports: Qwen2-VL, Qwen2.5-VL, Qwen3-VL
-    
-    Features:
-    - NCCL-based all_gather for efficient embedding aggregation across DP actors
-    - NCCL-based broadcast to send embeddings to LLM actors
+    Each actor loads the vision encoder and processes a subset of images.
+    NCCL all_gather combines embeddings across DP actors.
     
     Args:
         model_name_or_path: HuggingFace model name or local path
-        rank: Actor rank for logging/identification
+        dp_rank: Data parallel rank of this actor
         dp_size: Data parallel size (number of vision actors)
+        global_rank: Global rank in the full distributed world
         dtype: Model dtype (default: bfloat16)
         device: Device to use (default: cuda:0)
     """
@@ -48,37 +45,41 @@ class QwenVLVisionActor:
     def __init__(
         self,
         model_name_or_path: str,
-        rank: int = 0,
+        dp_rank: int = 0,
         dp_size: int = 1,
+        global_rank: int = None,
         dtype: torch.dtype = torch.bfloat16,
         device: str = "cuda:0",
     ):
         self.model_name_or_path = model_name_or_path
-        self.rank = rank
+        self.dp_rank = dp_rank
         self.dp_size = dp_size
+        self.global_rank = global_rank if global_rank is not None else dp_rank
         self.dtype = dtype
         self.device = torch.device(device)
         self.model: Optional[nn.Module] = None
-        self.full_model = None  # Keep reference for potential future use
+        self.full_model = None
         self.config = None
         self.model_type = None
         self._distributed_initialized = False
         self._dp_group = None
-        self._pipeline_group = None  # For vision-to-LLM communication
+        self._world_size = None
         
-        logger.info(f"Vision actor {rank}/{dp_size} initialized with model {model_name_or_path}")
+        logger.info(
+            f"Vision actor dp_rank={dp_rank}/{dp_size} (global_rank={self.global_rank}) "
+            f"initialized with model {model_name_or_path}"
+        )
     
     def get_ip_address(self) -> str:
         """Get the IP address of this actor for NCCL communication."""
         hostname = socket.gethostname()
-        ip_addr = socket.gethostbyname(hostname)
-        return ip_addr
+        return socket.gethostbyname(hostname)
     
     def init_distributed(
         self,
         master_addr: str,
         master_port: int,
-        world_size: int = None,
+        world_size: int,
         llm_tp_size: int = 0,
     ) -> None:
         """
@@ -87,88 +88,48 @@ class QwenVLVisionActor:
         Args:
             master_addr: IP address of rank 0 for NCCL rendezvous
             master_port: Port for NCCL rendezvous
-            world_size: Total world size (defaults to dp_size)
-            llm_tp_size: Number of LLM TP actors (for creating pipeline group)
+            world_size: Total world size (all vision + LLM actors)
+            llm_tp_size: Number of LLM TP actors (for non-colocated mode)
         """
         if self._distributed_initialized:
-            logger.info(f"Vision actor {self.rank}: Distributed already initialized")
+            logger.info(f"Vision actor {self.dp_rank}: Distributed already initialized")
             return
         
-        if self.dp_size <= 1 and llm_tp_size <= 0:
-            logger.info(f"Vision actor {self.rank}: DP size is 1 and no pipeline, skipping distributed init")
-            return
-        
-        ws = world_size if world_size is not None else self.dp_size
+        self._world_size = world_size
         
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = str(master_port)
-        os.environ["RANK"] = str(self.rank)
-        os.environ["WORLD_SIZE"] = str(ws)
+        os.environ["RANK"] = str(self.global_rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
         
         logger.info(
-            f"Vision actor {self.rank}: Initializing distributed "
-            f"(master={master_addr}:{master_port}, rank={self.rank}/{ws})"
+            f"Vision actor dp_rank={self.dp_rank}: Initializing distributed "
+            f"(master={master_addr}:{master_port}, global_rank={self.global_rank}/{world_size})"
         )
         
         dist.init_process_group(
             backend="nccl",
-            rank=self.rank,
-            world_size=ws,
+            rank=self.global_rank,
+            world_size=world_size,
         )
         
-        # Create a DP process group for vision actors
-        self._dp_group = dist.new_group(ranks=list(range(self.dp_size)))
-        
-        # Create a pipeline group for vision-to-LLM communication (only for rank 0)
-        if llm_tp_size > 0 and self.rank == 0:
-            # Vision rank 0 + all LLM ranks
-            llm_ranks = list(range(self.dp_size, self.dp_size + llm_tp_size))
-            pipeline_ranks = [0] + llm_ranks
-            self._pipeline_group = dist.new_group(ranks=pipeline_ranks)
-            logger.info(
-                f"Vision actor {self.rank}: Created pipeline group with ranks {pipeline_ranks}"
-            )
-        else:
-            self._pipeline_group = None
+        # Create DP process group for vision actors
+        vision_ranks = list(range(self.dp_size))
+        self._dp_group = dist.new_group(ranks=vision_ranks)
+        logger.info(f"Vision actor dp_rank={self.dp_rank}: Created DP group with ranks {vision_ranks}")
         
         self._distributed_initialized = True
-        logger.info(f"Vision actor {self.rank}: Distributed initialized successfully")
+        logger.info(f"Vision actor dp_rank={self.dp_rank}: Distributed initialized successfully")
     
     def cleanup_distributed(self) -> None:
-        """Clean up distributed resources before actor termination."""
+        """Clean up distributed resources."""
         if self._distributed_initialized:
             try:
                 dist.destroy_process_group()
                 self._distributed_initialized = False
-                logger.info(f"Vision actor {self.rank}: Distributed cleaned up")
+                logger.info(f"Vision actor {self.dp_rank}: Distributed cleaned up")
             except Exception as e:
-                logger.warning(f"Vision actor {self.rank}: Cleanup failed: {e}")
-    
-    def broadcast_to_llm(self, embeddings: torch.Tensor) -> None:
-        """
-        Broadcast embeddings to all LLM actors via NCCL.
-        
-        Only vision rank 0 should call this method.
-        
-        Args:
-            embeddings: Full vision embeddings to broadcast [seq_len, hidden]
-        """
-        if self.rank != 0:
-            logger.warning(f"Vision actor {self.rank}: Only rank 0 should broadcast to LLM")
-            return
-        
-        if self._pipeline_group is None:
-            raise RuntimeError("Pipeline group not initialized. Call init_distributed with llm_tp_size > 0")
-        
-        embeddings = embeddings.to(device=self.device, dtype=self.dtype)
-        
-        # Broadcast from vision rank 0 (which is rank 0 in the pipeline group)
-        dist.broadcast(embeddings, src=0, group=self._pipeline_group)
-        
-        logger.info(
-            f"Vision actor {self.rank}: Broadcasted embeddings to LLM actors, "
-            f"shape {embeddings.shape}"
-        )
+                logger.warning(f"Vision actor {self.dp_rank}: Cleanup failed: {e}")
     
     def send_embeddings_p2p(
         self,
@@ -176,32 +137,47 @@ class QwenVLVisionActor:
         dst_rank: int,
     ) -> None:
         """
-        Send embeddings to a specific LLM actor via NCCL P2P (point-to-point).
+        Send embeddings to a specific rank via NCCL P2P.
         
         Args:
             embeddings: Vision embeddings to send [seq_len, hidden]
-            dst_rank: Global rank of destination LLM actor
+            dst_rank: Global rank of destination
         """
         if not self._distributed_initialized:
-            raise RuntimeError("Distributed not initialized. Call init_distributed first.")
+            raise RuntimeError("Distributed not initialized")
         
         embeddings = embeddings.to(device=self.device, dtype=self.dtype).contiguous()
-        
-        # Send using async NCCL P2P and wait
         req = dist.isend(embeddings, dst=dst_rank)
         req.wait()
         
         logger.info(
-            f"Vision actor {self.rank}: Sent embeddings to rank {dst_rank} via NCCL P2P, "
+            f"Vision actor dp_rank={self.dp_rank}: Sent embeddings to rank {dst_rank}, "
             f"shape {embeddings.shape}"
+        )
+    
+    def broadcast_embeddings(
+        self,
+        embeddings: torch.Tensor,
+    ) -> None:
+        """
+        Broadcast embeddings to all ranks from this actor.
+        
+        Args:
+            embeddings: Vision embeddings to broadcast [seq_len, hidden]
+        """
+        if not self._distributed_initialized:
+            raise RuntimeError("Distributed not initialized")
+        
+        embeddings = embeddings.to(device=self.device, dtype=self.dtype).contiguous()
+        dist.broadcast(embeddings, src=self.global_rank)
+        
+        logger.info(
+            f"Vision actor dp_rank={self.dp_rank}: Broadcasted embeddings, shape {embeddings.shape}"
         )
     
     def all_gather_embeddings(self, local_embeddings: torch.Tensor) -> torch.Tensor:
         """
         All-gather vision embeddings from all DP actors using NCCL.
-        
-        Each actor has processed a portion of the images. This method
-        uses NCCL all_gather so each actor ends up with the FULL batch.
         
         Args:
             local_embeddings: This actor's vision embeddings [local_seq, hidden]
@@ -214,7 +190,7 @@ class QwenVLVisionActor:
         
         local_embeddings = local_embeddings.to(device=self.device, dtype=self.dtype)
         
-        # First, gather sizes from all ranks (to handle variable sizes)
+        # Gather sizes from all ranks (handles variable sizes)
         local_size = torch.tensor([local_embeddings.shape[0]], device=self.device, dtype=torch.long)
         all_sizes = [torch.zeros(1, device=self.device, dtype=torch.long) for _ in range(self.dp_size)]
         dist.all_gather(all_sizes, local_size, group=self._dp_group)
@@ -223,7 +199,7 @@ class QwenVLVisionActor:
         max_size = max(all_sizes)
         hidden_size = local_embeddings.shape[-1]
         
-        # Pad local embeddings to max size for uniform all_gather
+        # Pad local embeddings for uniform all_gather
         if local_embeddings.shape[0] < max_size:
             padding = torch.zeros(
                 max_size - local_embeddings.shape[0], hidden_size,
@@ -233,7 +209,7 @@ class QwenVLVisionActor:
         else:
             padded_local = local_embeddings
         
-        # All-gather padded tensors using NCCL
+        # All-gather padded tensors
         gathered = [torch.zeros_like(padded_local) for _ in range(self.dp_size)]
         dist.all_gather(gathered, padded_local, group=self._dp_group)
         
@@ -242,53 +218,19 @@ class QwenVLVisionActor:
         full_embeddings = torch.cat(trimmed, dim=0)
         
         logger.info(
-            f"Vision actor {self.rank}: NCCL all_gather embeddings "
+            f"Vision actor dp_rank={self.dp_rank}: All-gathered embeddings "
             f"from {local_embeddings.shape} to {full_embeddings.shape}"
         )
-        
         return full_embeddings
-    
-    def broadcast_embeddings(
-        self,
-        embeddings: torch.Tensor,
-        src_rank: int = 0,
-    ) -> torch.Tensor:
-        """
-        Broadcast embeddings from source rank to all ranks using NCCL.
-        
-        Args:
-            embeddings: Embeddings to broadcast (only used on src_rank)
-            src_rank: Source rank for broadcast
-        
-        Returns:
-            Broadcasted embeddings (same on all ranks)
-        """
-        if not self._distributed_initialized:
-            return embeddings
-        
-        embeddings = embeddings.to(device=self.device, dtype=self.dtype)
-        dist.broadcast(embeddings, src=src_rank)
-        
-        logger.info(
-            f"Vision actor {self.rank}: NCCL broadcast from rank {src_rank}, "
-            f"shape {embeddings.shape}"
-        )
-        
-        return embeddings
     
     def build_model(self) -> None:
         """
         Build and load the vision encoder model.
-        
-        This loads the full Qwen VL model from HuggingFace transformers and 
-        extracts the vision encoder.
         """
-        import torch
         from transformers import AutoConfig, AutoModel
         
-        logger.info(f"Vision actor {self.rank}: Loading config from {self.model_name_or_path}")
+        logger.info(f"Vision actor {self.dp_rank}: Loading config from {self.model_name_or_path}")
         
-        # Load HuggingFace config
         hf_config = AutoConfig.from_pretrained(
             self.model_name_or_path,
             trust_remote_code=True,
@@ -304,14 +246,9 @@ class QwenVLVisionActor:
         else:
             self.model_type = "Qwen2-VL"
         
-        logger.info(f"Vision actor {self.rank}: Detected model type: {self.model_type}")
-        
-        # Load the full model and extract vision encoder
-        logger.info(f"Vision actor {self.rank}: Loading model from transformers")
+        logger.info(f"Vision actor {self.dp_rank}: Detected model type: {self.model_type}")
         
         try:
-            # Try loading with AutoModel for vision-language models
-            # First try without device_map (doesn't require accelerate)
             self.full_model = AutoModel.from_pretrained(
                 self.model_name_or_path,
                 torch_dtype=self.dtype,
@@ -319,43 +256,31 @@ class QwenVLVisionActor:
             )
             self.full_model = self.full_model.to(self.device)
             
-            # Extract vision encoder - Qwen VL models have 'visual' attribute
+            # Extract vision encoder
             if hasattr(self.full_model, 'visual'):
                 self.model = self.full_model.visual
-                logger.info(f"Vision actor {self.rank}: Extracted 'visual' encoder")
+                logger.info(f"Vision actor {self.dp_rank}: Extracted 'visual' encoder")
             elif hasattr(self.full_model, 'vision_model'):
                 self.model = self.full_model.vision_model
-                logger.info(f"Vision actor {self.rank}: Extracted 'vision_model' encoder")
             elif hasattr(self.full_model, 'vision_tower'):
                 self.model = self.full_model.vision_tower
-                logger.info(f"Vision actor {self.rank}: Extracted 'vision_tower' encoder")
             else:
-                # If we can't find the vision encoder, use the full model
-                logger.warning(
-                    f"Vision actor {self.rank}: Could not find vision encoder, "
-                    "using full model"
-                )
                 self.model = self.full_model
-                
-        except Exception as e:
-            logger.warning(f"Vision actor {self.rank}: Error loading model: {e}")
-            logger.info(f"Vision actor {self.rank}: Creating placeholder vision encoder")
             
-            # Create a placeholder vision encoder for testing
+        except Exception as e:
+            logger.warning(f"Vision actor {self.dp_rank}: Error loading model: {e}")
             vision_config = getattr(hf_config, 'vision_config', hf_config)
             hidden_size = getattr(vision_config, 'hidden_size', 1152)
             out_hidden_size = getattr(vision_config, 'out_hidden_size', hidden_size)
             
             self.model = nn.Sequential(
-                nn.Linear(3 * 2 * 14 * 14, hidden_size),  # patch_dim -> hidden
+                nn.Linear(3 * 2 * 14 * 14, hidden_size),
                 nn.GELU(),
                 nn.Linear(hidden_size, out_hidden_size),
             ).to(device=self.device, dtype=self.dtype)
         
-        # Set to eval mode
         self.model.eval()
-        
-        logger.info(f"Vision actor {self.rank}: Model built successfully")
+        logger.info(f"Vision actor {self.dp_rank}: Model built successfully")
     
     def forward(
         self,
@@ -366,44 +291,34 @@ class QwenVLVisionActor:
         Forward pass through the vision encoder.
         
         Args:
-            pixel_values: Image/video pixel values [L, C] where L is total patches
-            grid_thw: Grid dimensions [N, 3] with (temporal, height, width) for each item
+            pixel_values: Image/video pixel values [L, C]
+            grid_thw: Grid dimensions [N, 3] with (temporal, height, width)
         
         Returns:
             Vision embeddings [num_tokens, hidden_size]
         """
         if self.model is None:
-            raise RuntimeError(
-                f"Vision actor {self.rank}: Model not built. Call build_model() first."
-            )
+            raise RuntimeError("Model not built. Call build_model() first.")
         
-        # Move inputs to device
         pixel_values = pixel_values.to(device=self.device, dtype=self.dtype)
         if isinstance(grid_thw, torch.Tensor):
             grid_thw_tensor = grid_thw.to(device=self.device)
-            grid_thw_list = grid_thw.tolist()
         else:
             grid_thw_tensor = torch.tensor(grid_thw, device=self.device)
-            grid_thw_list = grid_thw
         
         with torch.no_grad():
-            # Check if it's a real vision encoder or placeholder
             if isinstance(self.model, nn.Sequential):
-                # Placeholder model
                 embeddings = self.model(pixel_values)
             else:
-                # Real vision encoder
                 try:
                     embeddings = self.model(pixel_values, grid_thw=grid_thw_tensor)
                 except TypeError:
-                    # Some models don't take grid_thw
                     embeddings = self.model(pixel_values)
         
         logger.info(
-            f"Vision actor {self.rank}: Processed input shape {pixel_values.shape}, "
-            f"output shape {embeddings.shape}"
+            f"Vision actor dp_rank={self.dp_rank}: Forward complete, "
+            f"input {pixel_values.shape} -> output {embeddings.shape}"
         )
-        
         return embeddings
     
     def get_output_hidden_size(self) -> int:
@@ -415,13 +330,13 @@ class QwenVLVisionActor:
                       getattr(vision_config, 'hidden_size', 1152))
 
 
-# Keep old name for backwards compatibility
+# Backward compatibility alias
 Qwen3VLVisionActor = QwenVLVisionActor
 
 
 def create_vision_actor_class(num_gpus: int = 1, num_cpus: int = 4):
     """
-    Create a Ray remote class for the vision actor with specified resources.
+    Create a Ray remote class for the vision actor.
     
     Args:
         num_gpus: Number of GPUs per actor
@@ -431,9 +346,3 @@ def create_vision_actor_class(num_gpus: int = 1, num_cpus: int = 4):
         Ray remote class
     """
     return ray.remote(num_gpus=num_gpus, num_cpus=num_cpus)(QwenVLVisionActor)
-
-
-def get_ip_address() -> str:
-    """Get the IP address for NCCL communication (utility function)."""
-    hostname = socket.gethostname()
-    return socket.gethostbyname(hostname)
