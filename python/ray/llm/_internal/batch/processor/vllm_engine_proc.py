@@ -244,6 +244,12 @@ def build_vllm_engine_processor(
         )
 
     # Core stage -- the vLLM engine.
+    # Normalize engine_kwargs before passing to constructor to ensure consistent cache key generation
+    import copy
+    normalized_engine_kwargs = copy.deepcopy(config.engine_kwargs)
+    task_type_str = config.task_type.value if hasattr(config.task_type, "value") else str(config.task_type)
+    # Ensure task is set to string value in engine_kwargs for consistent key generation
+    normalized_engine_kwargs["task"] = task_type_str
 
     stages.append(
         vLLMEngineStage(
@@ -251,8 +257,8 @@ def build_vllm_engine_processor(
                 batch_size=config.batch_size,
                 max_concurrent_batches=config.max_concurrent_batches,
                 model=config.model_source,
-                engine_kwargs=config.engine_kwargs,
-                task_type=config.task_type,
+                engine_kwargs=normalized_engine_kwargs,
+                task_type=task_type_str,
                 max_pending_requests=config.max_pending_requests,
                 dynamic_lora_loading_path=config.dynamic_lora_loading_path,
                 placement_group_config=config.placement_group_config,

@@ -235,7 +235,12 @@ class vLLMEngineWrapper:
     ):
         self.request_id = 0
         self.idx_in_batch_column = idx_in_batch_column
-        self.task_type = kwargs.get("task", vLLMTaskType.GENERATE)
+        task = kwargs.get("task", vLLMTaskType.GENERATE)
+        # Convert task to enum if it's a string (for consistent handling)
+        if isinstance(task, str):
+            self.task_type = vLLMTaskType(task)
+        else:
+            self.task_type = task
 
         # Use model_source in kwargs["model"] because "model" is actually
         # the model source in vLLM.
@@ -562,8 +567,13 @@ class vLLMEngineStageUDF(StatefulStageUDF):
         self.should_continue_on_error = should_continue_on_error
 
         # Setup vLLM engine kwargs.
-        self.task_type = task_type
-        self.engine_kwargs = self.normalize_engine_kwargs(task_type, engine_kwargs)
+        # Convert task_type to enum if it's a string (for consistent cache key generation)
+        if isinstance(task_type, str):
+            self.task_type = vLLMTaskType(task_type)
+        else:
+            self.task_type = task_type
+        # Make a copy to avoid modifying the original dict used for cache key generation
+        self.engine_kwargs = self.normalize_engine_kwargs(self.task_type, copy.deepcopy(engine_kwargs))
 
         # Set up the max pending requests.
         pp_size = self.engine_kwargs.get("pipeline_parallel_size", 1)
@@ -639,7 +649,13 @@ class vLLMEngineStageUDF(StatefulStageUDF):
             )
 
         # Override the task if it is different from the stage.
-        task = vLLMTaskType(engine_kwargs.get("task", task_type))
+        task_value = engine_kwargs.get("task", task_type.value)
+        # Convert to enum for comparison if it's a string
+        if isinstance(task_value, str):
+            task = vLLMTaskType(task_value)
+        else:
+            task = task_value if isinstance(task_value, vLLMTaskType) else vLLMTaskType(task_value)
+        
         if task != task_type:
             logger.warning(
                 "The task set in engine kwargs (%s) is different from the "
@@ -648,7 +664,8 @@ class vLLMEngineStageUDF(StatefulStageUDF):
                 task_type,
                 task_type,
             )
-        engine_kwargs["task"] = task_type
+        # Store task as string value for consistent cache key generation
+        engine_kwargs["task"] = task_type.value
         return engine_kwargs
 
     async def _generate_with_error_handling(
