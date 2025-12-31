@@ -4,6 +4,22 @@ import numpy as np
 from vllm import LLM
 import vllm
 
+from dataset import ShareGPTDataset
+
+from transformers import AutoTokenizer
+
+class Tokenizer:
+    def __init__(self, model_path: str):
+        self.model_path = model_path
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+
+    def __call__(self, batch) -> dict:
+        prompts = batch['prompt']
+        prompts = prompts.tolist()
+        
+        tokenized = self.tokenizer(prompts)
+        return {'input_ids': tokenized['input_ids']}
+
 class vLLMSyncWrapper:
     def __init__(self, model_path: str, output_column: str = "probs"):
         self.model_path = model_path
@@ -18,38 +34,67 @@ class vLLMSyncWrapper:
                 max_model_len=512,
             )
 
-        input_ids = batch['input_ids']
-        ids_np = np.stack(input_ids, axis=0)
+        input_ids = batch['input_ids'].tolist()
         
         prompts = [
             vllm.inputs.data.TokensPrompt(
-                prompt_token_ids=token_id,
-            ) for token_id in ids_np.tolist()
+                prompt_token_ids=token_id_list.tolist(),
+            ) for token_id_list in input_ids
         ]
-        
-        result = self.llm.encode(
+
+        result = self.llm.classify(
             prompts=prompts,
-            pooling_task="classify",
             pooling_params=vllm.PoolingParams(
                 truncate_prompt_tokens=-1,
                 task="classify",
             ),
-            truncate_prompt_tokens=-1,
         )
-        
+
         output = {
-            self.output_column: result,
+            self.output_column: [out.outputs.probs for out in result]
         }
+        
+        # result = self.llm.encode(
+        #     prompts=prompts,
+        #     pooling_task="classify",
+        #     pooling_params=vllm.PoolingParams(
+        #         truncate_prompt_tokens=-1,
+        #         task="classify",
+        #     ),
+        #     truncate_prompt_tokens=-1,
+        # )
+        
+        # output = {
+        #     self.output_column: result,
+        # }
         
         return output
 
 def main():
     ray.init()
     model_name = "HuggingFaceTB/fineweb-edu-classifier"
-    dataset_size = 100_000  # 4GB for 1_000_000 items
+    dataset_size = 1_000_000  # 4GB for 1_000_000 items
 
-    ds = ray.data.from_items([{"prompt": "Hello", "input_ids": [1] * 512} for _ in range(dataset_size)])
-    ds = ds.repartition(8)
+    dataset = ShareGPTDataset(
+        dataset_path="/tmp/data/Code-feedback-sharegpt-renamed",
+        seed=0,
+        hf_dataset_id="Crystalcareai/Code-feedback-sharegpt-renamed",
+        hf_split="train",
+        truncate_prompt=512,
+    )
+    prompts = dataset.sample(dataset_size)
+
+    ds = ray.data.from_items(prompts)
+    # ds = ds.repartition(8)
+
+    ds = ds.map_batches(
+        Tokenizer(model_name),
+        batch_size=512,
+        zero_copy_batch=True,
+        fn_constructor_kwargs={
+            "model_path": model_name,
+        },
+    )
 
     classified_ds = ds.map_batches(
         vLLMSyncWrapper(model_name),
