@@ -203,6 +203,7 @@ def test_generation_model(gpu_type, model_opt_125m, backend):
 
 def test_generation_model_tokenized_prompt(gpu_type, model_opt_125m):
     from transformers import AutoTokenizer
+
     tokenizer = AutoTokenizer.from_pretrained(model_opt_125m, trust_remote_code=True)
 
     processor_config = vLLMEngineProcessorConfig(
@@ -293,7 +294,10 @@ def test_generation_model_missing_prompt_and_tokenized_prompt(gpu_type, model_op
         ds = ds.materialize()
 
     error_str = str(exc_info.value)
-    assert "Either 'prompt' (text) or 'tokenized_prompt' (tokens) must be provided" in error_str
+    assert (
+        "Either 'prompt' (text) or 'tokenized_prompt' (tokens) must be provided"
+        in error_str
+    )
 
 
 def test_embedding_model(gpu_type, model_smolvlm_256m):
